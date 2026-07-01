@@ -249,6 +249,7 @@
       const resolutionEl = document.getElementById("resolution");
       const resolutionPreset = document.getElementById("resolutionPreset");
       const fullscreenToggle = document.getElementById("fullscreenToggle");
+      const resolutionStorageKey = "rdp2web.resolutionPreset";
 
       let socket = null;
       let rdpReady = false;
@@ -273,6 +274,30 @@
         const enabled = !resolutionEl.hidden;
         resolutionPreset.disabled = !enabled;
         fullscreenToggle.disabled = !enabled || !document.fullscreenEnabled;
+      }
+
+      function hasResolutionPreset(value) {
+        return Array.from(resolutionPreset.options).some((option) => option.value === value);
+      }
+
+      function loadResolutionPreset() {
+        try {
+          const value = window.localStorage.getItem(resolutionStorageKey);
+          if (!value) return;
+          if (hasResolutionPreset(value)) {
+            resolutionPreset.value = value;
+          } else {
+            window.localStorage.removeItem(resolutionStorageKey);
+          }
+        } catch {
+        }
+      }
+
+      function saveResolutionPreset() {
+        try {
+          window.localStorage.setItem(resolutionStorageKey, resolutionPreset.value);
+        } catch {
+        }
       }
 
       function setSizeControlsVisible(value) {
@@ -543,6 +568,7 @@
 
       function applyResolutionPreset() {
         const value = resolutionPreset.value;
+        saveResolutionPreset();
         syncSizeControlState();
 
         if (value === "auto") {
@@ -725,6 +751,7 @@
       document.addEventListener("fullscreenerror", () => {
         setStatus("Fullscreen unavailable", "error");
       });
+      loadResolutionPreset();
       updateFullscreenToggle();
 
       fetch("/api/config")

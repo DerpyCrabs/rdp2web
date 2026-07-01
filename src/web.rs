@@ -667,6 +667,12 @@ mod tests {
         assert!(!html.contains(r#"<option value="custom">Custom</option>"#));
         assert!(!html.contains(r#"type="number""#));
         assert!(html.contains("function applyAutoResize()"));
+        assert!(html.contains(r#"const resolutionStorageKey = "rdp2web.resolutionPreset";"#));
+        assert!(html.contains("function loadResolutionPreset()"));
+        assert!(html.contains("function saveResolutionPreset()"));
+        assert!(html.contains("window.localStorage.getItem(resolutionStorageKey)"));
+        assert!(html.contains("window.localStorage.setItem(resolutionStorageKey, resolutionPreset.value)"));
+        assert!(html.contains("loadResolutionPreset();"));
         assert!(html.contains("stageEl.clientWidth || document.documentElement.clientWidth"));
         assert!(html.contains("stageEl.clientHeight || document.documentElement.clientHeight"));
         assert!(html.contains(r#"send({ type: "resize""#));
