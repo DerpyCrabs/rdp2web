@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>rdp2web</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #111416;
+        --panel: #1c2227;
+        --panel-2: #252d33;
+        --text: #eef2f3;
+        --muted: #a8b3b8;
+        --accent: #3fb58f;
+        --danger: #d96c6c;
+        --border: #354047;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        overflow: hidden;
+        overscroll-behavior: none;
+        user-select: none;
+      }
+
+      .shell {
+        display: grid;
+        grid-template-rows: auto 1fr;
+        min-height: 100%;
+      }
+
+      header {
+        align-items: center;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        gap: 12px;
+        min-height: 48px;
+        padding: 8px 12px;
+      }
+
+      .shell.connected {
+        display: block;
+        min-height: 100%;
+      }
+
+      .shell.connected header {
+        left: 0;
+        opacity: 0.18;
+        position: fixed;
+        right: 0;
+        top: 0;
+        transform: translateY(calc(-100% + 6px));
+        transition: opacity 120ms ease, transform 120ms ease;
+        z-index: 10;
+      }
+
+      .shell.connected header:hover,
+      .shell.connected header:focus-within {
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      .shell.connected main {
+        height: 100vh;
+      }
+
+      .brand {
+        font-weight: 650;
+        margin-right: auto;
+      }
+
+      .metrics {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        min-width: 64px;
+        text-align: right;
+        white-space: nowrap;
+      }
+
+      .metrics.active {
+        color: var(--text);
+      }
+
+      .status {
+        color: var(--muted);
+        min-width: 120px;
+        overflow: hidden;
+        text-align: right;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .status.connected {
+        color: var(--accent);
+      }
+
+      .status.error {
+        color: var(--danger);
+      }
+
+      .size-controls {
+        align-items: center;
+        display: inline-flex;
+        gap: 6px;
+      }
+
+      .size-controls[hidden] {
+        display: none;
+      }
+
+      .size-field {
+        align-items: center;
+        color: var(--muted);
+        display: inline-flex;
+        gap: 4px;
+      }
+
+      input[type="number"] {
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        color: var(--text);
+        font: inherit;
+        height: 32px;
+        padding: 0 8px;
+        width: 86px;
+      }
+
+      input[type="number"]:disabled {
+        color: var(--muted);
+      }
+
+      main {
+        min-height: 0;
+        overflow: hidden;
+        position: relative;
+      }
+
+      .stage {
+        align-items: center;
+        display: flex;
+        height: 100%;
+        justify-content: center;
+        overflow: hidden;
+        width: 100%;
+      }
+
+      canvas {
+        background: #050607;
+        box-shadow: 0 0 0 1px var(--border);
+        cursor: default;
+        display: block;
+        height: auto;
+        image-rendering: auto;
+        max-height: 100%;
+        max-width: 100%;
+        outline: none;
+        touch-action: none;
+        width: auto;
+      }
+
+      .empty {
+        color: var(--muted);
+        left: 50%;
+        position: absolute;
+        text-align: center;
+        top: 50%;
+        transform: translate(-50%, -50%);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <header>
+        <div class="brand">rdp2web</div>
+        <div id="fps" class="metrics">0 fps</div>
+        <div id="status" class="status">Disconnected</div>
+        <div id="resolution" class="size-controls" hidden>
+          <label class="size-field">W <input id="width" type="number" min="200" max="32766" step="1"></label>
+          <label class="size-field">H <input id="height" type="number" min="200" max="32766" step="1"></label>
+        </div>
+      </header>
+      <main>
+        <div class="stage">
+          <canvas id="screen" tabindex="0"></canvas>
+        </div>
+        <div id="empty" class="empty">Connecting</div>
+      </main>
+    </div>
+
+    <script>
+      const shellEl = document.querySelector(".shell");
+      const canvas = document.getElementById("screen");
+      const stageEl = document.querySelector(".stage");
+      const ctx = canvas.getContext("2d", { alpha: false });
+      ctx.imageSmoothingEnabled = false;
+      const statusEl = document.getElementById("status");
+      const fpsEl = document.getElementById("fps");
+      const emptyEl = document.getElementById("empty");
+      const resolutionEl = document.getElementById("resolution");
+      const widthInput = document.getElementById("width");
+      const heightInput = document.getElementById("height");
+
+      let socket = null;
+      let rdpReady = false;
+      let retryTimer = null;
+      let sawDesktopSize = false;
+      let codec = "";
+      let decoder = null;
+      let pendingFrame = null;
+      let pendingDraw = false;
+      let fpsFrames = 0;
+      let fpsStartedAt = 0;
+      let fpsLastFrameAt = 0;
+
+      function setStatus(text, kind = "") {
+        statusEl.textContent = text;
+        statusEl.className = `status ${kind}`.trim();
+      }
+
+      function setFallbackSizeVisible(value) {
+        resolutionEl.hidden = !value;
+        widthInput.disabled = !value;
+        heightInput.disabled = !value;
+      }
+
+      function resetFps() {
+        fpsFrames = 0;
+        fpsLastFrameAt = 0;
+        fpsStartedAt = performance.now();
+        fpsEl.textContent = "0 fps";
+        fpsEl.className = "metrics";
+      }
+
+      function recordFrameDrawn() {
+        const now = performance.now();
+        if (!fpsStartedAt) fpsStartedAt = now;
+        fpsFrames += 1;
+        fpsLastFrameAt = now;
+      }
+
+      function renderFps() {
+        const now = performance.now();
+        if (!fpsStartedAt) fpsStartedAt = now;
+        const elapsedSeconds = Math.max((now - fpsStartedAt) / 1000, 0.001);
+        const fps = fpsFrames / elapsedSeconds;
+        const stale = !fpsLastFrameAt || now - fpsLastFrameAt > 1500;
+        const visibleFps = stale ? 0 : fps;
+        fpsEl.textContent = `${visibleFps.toFixed(visibleFps < 10 ? 1 : 0)} fps`;
+        fpsEl.className = visibleFps > 0 ? "metrics active" : "metrics";
+        fpsFrames = 0;
+        fpsStartedAt = now;
+      }
+
+      function setReady(value) {
+        rdpReady = value;
+        shellEl.classList.toggle("connected", value);
+        setFallbackSizeVisible(false);
+      }
+
+      function send(payload) {
+        if (!rdpReady || !socket || socket.readyState !== WebSocket.OPEN) return;
+        socket.send(JSON.stringify(payload));
+      }
+
+      function closeFrame(frame) {
+        if (frame && typeof frame.close === "function") frame.close();
+      }
+
+      function closeDecoder() {
+        if (decoder) {
+          try {
+            decoder.close();
+          } catch {
+          }
+        }
+        decoder = null;
+        codec = "";
+        if (pendingFrame) {
+          closeFrame(pendingFrame);
+          pendingFrame = null;
+        }
+        pendingDraw = false;
+      }
+
+      function setupCodec(video) {
+        closeDecoder();
+        if (typeof VideoDecoder !== "function" || typeof EncodedVideoChunk !== "function") {
+          setStatus("WebCodecs unavailable", "error");
+          return;
+        }
+
+        const h264 = video && video.h264;
+        if (!h264) {
+          setStatus("No H.264 stream", "error");
+          return;
+        }
+
+        if (h264.codec) {
+          codec = h264.codec;
+        } else if (h264.profile_level_id) {
+          codec = `avc1.${h264.profile_level_id}`;
+        }
+      }
+
+      async function ensureDecoder(key) {
+        if (!codec) return false;
+        if (!decoder || decoder.state === "closed") {
+          decoder = new VideoDecoder({
+            output: renderVideoFrame,
+            error: (error) => setStatus(error.message, "error")
+          });
+        }
+        if (decoder.state !== "configured") {
+          if (!key) return false;
+          await decoder.configure({
+            codec,
+            optimizeForLatency: true,
+            avc: { format: "annexb" }
+          });
+        }
+        return decoder.state === "configured";
+      }
+
+      function findStartCode(data, from) {
+        for (let offset = from; offset + 3 <= data.length; offset += 1) {
+          if (offset + 4 <= data.length && data[offset] === 0 && data[offset + 1] === 0 && data[offset + 2] === 0 && data[offset + 3] === 1) {
+            return { offset, length: 4 };
+          }
+          if (data[offset] === 0 && data[offset + 1] === 0 && data[offset + 2] === 1) {
+            return { offset, length: 3 };
+          }
+        }
+        return null;
+      }
+
+      function h264CodecFromAnnexB(data) {
+        let start = findStartCode(data, 0);
+        while (start) {
+          const nalStart = start.offset + start.length;
+          const next = findStartCode(data, nalStart);
+          const nalEnd = next ? next.offset : data.length;
+          if (nalEnd > nalStart && (data[nalStart] & 0x1f) === 7 && nalEnd - nalStart >= 4) {
+            return `avc1.${[data[nalStart + 1], data[nalStart + 2], data[nalStart + 3]].map((value) => value.toString(16).padStart(2, "0")).join("").toUpperCase()}`;
+          }
+          start = next;
+        }
+        return "";
+      }
+
+      async function handleVideoPacket(buffer) {
+        if (buffer.byteLength < 2) return;
+        const header = new Uint8Array(buffer, 0, 2);
+        if (header[0] !== 1) return;
+
+        const key = header[1] !== 0;
+        const payload = new Uint8Array(buffer, 2);
+        if (key) {
+          const detectedCodec = h264CodecFromAnnexB(payload);
+          if (detectedCodec && detectedCodec !== codec) {
+            closeDecoder();
+            codec = detectedCodec;
+          }
+        }
+        if (!(await ensureDecoder(key))) return;
+
+        decoder.decode(new EncodedVideoChunk({
+          timestamp: Math.trunc(performance.now() * 1000),
+          type: key ? "key" : "delta",
+          data: payload
+        }));
+      }
+
+      function renderVideoFrame(frame) {
+        if (pendingFrame) {
+          closeFrame(pendingFrame);
+        }
+        pendingFrame = frame;
+        if (!pendingDraw) {
+          pendingDraw = true;
+          window.requestAnimationFrame(drawPendingFrame);
+        }
+      }
+
+      function drawPendingFrame() {
+        pendingDraw = false;
+        if (!pendingFrame) return;
+
+        const frame = pendingFrame;
+        pendingFrame = null;
+        try {
+          if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+            canvas.width = frame.displayWidth;
+            canvas.height = frame.displayHeight;
+            ctx.imageSmoothingEnabled = false;
+          }
+          fitCanvas();
+          ctx.drawImage(frame, 0, 0);
+          emptyEl.hidden = true;
+          recordFrameDrawn();
+        } finally {
+          closeFrame(frame);
+        }
+      }
+
+      function canvasPoint(event) {
+        const rect = canvas.getBoundingClientRect();
+        if (!canvas.width || !canvas.height || !rect.width || !rect.height) return null;
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        return {
+          x: Math.max(0, Math.min(canvas.width - 1, Math.round((event.clientX - rect.left) * scaleX))),
+          y: Math.max(0, Math.min(canvas.height - 1, Math.round((event.clientY - rect.top) * scaleY)))
+        };
+      }
+
+      function setDesktopSize(width, height) {
+        sawDesktopSize = true;
+        widthInput.value = width;
+        heightInput.value = height;
+        setStatus(`${width}x${height}`, "connected");
+      }
+
+      function fitCanvas() {
+        if (!canvas.width || !canvas.height) return;
+        const availableWidth = stageEl.clientWidth;
+        const availableHeight = stageEl.clientHeight;
+        if (!availableWidth || !availableHeight) return;
+
+        const dpr = window.devicePixelRatio || 1;
+        const scale = Math.min(
+          availableWidth / canvas.width,
+          availableHeight / canvas.height,
+          1 / dpr
+        );
+        canvas.style.width = `${Math.max(1, Math.floor(canvas.width * scale))}px`;
+        canvas.style.height = `${Math.max(1, Math.floor(canvas.height * scale))}px`;
+      }
+
+      function connect() {
+        if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+
+        window.clearTimeout(retryTimer);
+        setReady(false);
+        resetFps();
+        setFallbackSizeVisible(false);
+        emptyEl.hidden = false;
+
+        const wsUrl = new URL("/ws/rdp", window.location.href);
+        wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
+        const width = Number.parseInt(widthInput.value, 10);
+        const height = Number.parseInt(heightInput.value, 10);
+        if (Number.isFinite(width) && width >= 200) wsUrl.searchParams.set("width", String(width));
+        if (Number.isFinite(height) && height >= 200) wsUrl.searchParams.set("height", String(height));
+        socket = new WebSocket(wsUrl);
+        socket.binaryType = "arraybuffer";
+        setStatus("Connecting");
+
+        socket.addEventListener("open", () => {
+          canvas.focus();
+        });
+
+        socket.addEventListener("message", async (event) => {
+          if (event.data instanceof ArrayBuffer) {
+            handleVideoPacket(event.data).catch((error) => {
+              setStatus(error.message, "error");
+            });
+            return;
+          }
+
+          const message = JSON.parse(event.data);
+          if (message.type === "media") {
+            setupCodec(message.video);
+          } else if (message.type === "connected") {
+            setReady(true);
+            setStatus("Connected", "connected");
+          } else if (message.type === "desktop_size") {
+            setDesktopSize(message.width, message.height);
+          } else if (message.type === "connecting") {
+            setStatus("Connecting");
+          } else if (message.type === "error") {
+            setStatus(message.message, "error");
+            setFallbackSizeVisible(!sawDesktopSize);
+          } else if (message.type === "disconnected") {
+            setStatus(message.reason);
+            setFallbackSizeVisible(!sawDesktopSize);
+          }
+        });
+
+        socket.addEventListener("close", () => {
+          socket = null;
+          closeDecoder();
+          setReady(false);
+          setStatus("Reconnecting");
+          setFallbackSizeVisible(!sawDesktopSize);
+          retryTimer = window.setTimeout(connect, 1500);
+        });
+
+        socket.addEventListener("error", () => {
+          setStatus("WebSocket error", "error");
+          setFallbackSizeVisible(!sawDesktopSize);
+        });
+      }
+
+      canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+      canvas.addEventListener("pointermove", (event) => {
+        if (!rdpReady) return;
+        event.preventDefault();
+        const point = canvasPoint(event);
+        if (!point) return;
+        send({ type: "pointer", action: "move", x: point.x, y: point.y });
+      });
+      canvas.addEventListener("pointerdown", (event) => {
+        if (!rdpReady) return;
+        event.preventDefault();
+        if (canvas.setPointerCapture) canvas.setPointerCapture(event.pointerId);
+        canvas.focus();
+        const point = canvasPoint(event);
+        if (!point) return;
+        send({ type: "pointer", action: "down", x: point.x, y: point.y, button: event.button });
+      });
+      canvas.addEventListener("pointerup", (event) => {
+        if (!rdpReady) return;
+        event.preventDefault();
+        if (canvas.releasePointerCapture && canvas.hasPointerCapture(event.pointerId)) {
+          canvas.releasePointerCapture(event.pointerId);
+        }
+        const point = canvasPoint(event);
+        if (!point) return;
+        send({ type: "pointer", action: "up", x: point.x, y: point.y, button: event.button });
+      });
+      canvas.addEventListener("wheel", (event) => {
+        if (!rdpReady) return;
+        event.preventDefault();
+        const point = canvasPoint(event);
+        if (!point) return;
+        send({
+          type: "pointer",
+          action: "wheel",
+          x: point.x,
+          y: point.y,
+          delta_y: Math.max(-255, Math.min(255, Math.trunc(-event.deltaY)))
+        });
+      }, { passive: false });
+      canvas.addEventListener("keydown", (event) => {
+        if (!rdpReady) return;
+        event.preventDefault();
+        send({ type: "key", down: true, code: event.code, key: event.key });
+      });
+      canvas.addEventListener("keyup", (event) => {
+        if (!rdpReady) return;
+        event.preventDefault();
+        send({ type: "key", down: false, code: event.code, key: event.key });
+      });
+      window.addEventListener("resize", () => {
+        fitCanvas();
+      });
+      window.setInterval(renderFps, 1000);
+      widthInput.addEventListener("change", () => {
+        if (!socket) connect();
+      });
+      heightInput.addEventListener("change", () => {
+        if (!socket) connect();
+      });
+
+      fetch("/api/config")
+        .then((response) => response.json())
+        .then((config) => {
+          widthInput.value = config.default_width;
+          heightInput.value = config.default_height;
+          connect();
+        })
+        .catch(() => {
+          setFallbackSizeVisible(true);
+          setStatus("Config unavailable", "error");
+        });
+    </script>
+  </body>
+</html>

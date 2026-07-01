@@ -1,0 +1,6 @@
+/target
+/certs/*.crt
+/certs/*.key
+.env
+.env.*
+!.env.example
