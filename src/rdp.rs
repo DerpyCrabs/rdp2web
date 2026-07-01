@@ -1,4 +1,4 @@
-use crate::config::RdpConfig;
+use crate::config::{RdpConfig, RdpMode, RdpRedirectionAuth};
 use crate::input::slow_input_events_from_client;
 use anyhow::{Context, bail};
 use ironrdp::connector;
@@ -8,15 +8,19 @@ use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageOutput};
 use ironrdp_core::WriteBuf;
+use ironrdp_displaycontrol::client::DisplayControlClient;
 use ironrdp_dvc::DrdynvcClient;
 use ironrdp_egfx::client::{EncodedAvc420Frame, GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_egfx::pdu::{CapabilitiesV81Flags, CapabilitySet, Codec2Type, WireToSurface2Pdu};
+use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::rdp::capability_sets::client_codecs_capabilities;
 use ironrdp_pdu::rdp::client_info::{CompressionType, PerformanceFlags, TimezoneInfo};
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
+use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
+use ironrdp_pdu::rdp::suppress_output::SuppressOutputPdu;
 use serde::{Deserialize, Serialize};
 use sspi::network_client::reqwest_network_client::ReqwestNetworkClient;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::mpsc::TryRecvError;
 use std::sync::{Once, mpsc};
@@ -25,8 +29,25 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio_rustls::rustls;
 use tracing::{debug, error, info, trace, warn};
 
-const CONNECT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const SHARED_CONNECT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_CONNECT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_millis(5);
+const MAX_SERVER_REDIRECTS: usize = 4;
+const RDSTLS_VERSION_1: u16 = 0x0001;
+const RDSTLS_TYPE_CAPABILITIES: u16 = 0x0001;
+const RDSTLS_TYPE_AUTHREQ: u16 = 0x0002;
+const RDSTLS_TYPE_AUTHRSP: u16 = 0x0004;
+const RDSTLS_DATA_CAPABILITIES: u16 = 0x0001;
+const RDSTLS_DATA_PASSWORD_CREDS: u16 = 0x0001;
+const RDSTLS_DATA_RESULT_CODE: u16 = 0x0001;
+const RDSTLS_RESULT_SUCCESS: u32 = 0x0000_0000;
+const RDSTLS_RESULT_ACCESS_DENIED: u32 = 0x0000_0005;
+const RDSTLS_RESULT_LOGON_FAILURE: u32 = 0x0000_052e;
+const RDSTLS_RESULT_INVALID_LOGON_HOURS: u32 = 0x0000_0530;
+const RDSTLS_RESULT_PASSWORD_EXPIRED: u32 = 0x0000_0532;
+const RDSTLS_RESULT_ACCOUNT_DISABLED: u32 = 0x0000_0533;
+const RDSTLS_RESULT_PASSWORD_MUST_CHANGE: u32 = 0x0000_0773;
+const RDSTLS_RESULT_ACCOUNT_LOCKED_OUT: u32 = 0x0000_0775;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientEvent {
@@ -46,6 +67,10 @@ pub enum ClientEvent {
         width: u16,
         height: u16,
     },
+    Refresh {
+        width: u16,
+        height: u16,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,7 +82,7 @@ pub enum PointerAction {
     Wheel,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ServerEvent {
     Status(ServerStatus),
     Video(VideoFrame),
@@ -69,7 +94,7 @@ pub struct VideoFrame {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerStatus {
     Connecting,
@@ -218,12 +243,19 @@ impl GraphicsPipelineHandler for EgfxHandler {
     fn on_avc420_frame(&mut self, frame: &EncodedAvc420Frame<'_>) {
         match avc_to_video_frame(frame.data) {
             Ok(video_frame) => {
+                let key = video_frame.key;
+                let bytes = video_frame.data.len();
                 if self
                     .server_tx
                     .blocking_send(ServerEvent::Video(video_frame))
                     .is_err()
                 {
                     debug!("websocket receiver closed while sending AVC420 frame");
+                } else {
+                    trace!(
+                        surface_id = frame.surface_id,
+                        key, bytes, "forwarded AVC420 frame to server event channel"
+                    );
                 }
             }
             Err(err) => {
@@ -347,7 +379,7 @@ pub fn start_rdp_session(
         if let Err(err) = result {
             error!(%err, "RDP session failed");
             let _ = server_tx.blocking_send(ServerEvent::Status(ServerStatus::Error {
-                message: err.to_string(),
+                message: format!("{err:#}"),
             }));
         }
     });
@@ -356,13 +388,16 @@ pub fn start_rdp_session(
 }
 
 pub fn validate_rdp_login(config: RdpConfig) -> anyhow::Result<(u16, u16)> {
+    let connect_read_timeout = connect_read_timeout_for_mode(config.mode);
     let connector_config = build_connector_config(&config)?;
     let (server_tx, _server_rx) = tokio_mpsc::channel(1);
     let (connection_result, _framed) = connect(
         connector_config,
+        &config,
         config.host.clone(),
         config.port,
         server_tx,
+        connect_read_timeout,
     )
     .context("connect RDP")?;
     Ok((
@@ -372,40 +407,63 @@ pub fn validate_rdp_login(config: RdpConfig) -> anyhow::Result<(u16, u16)> {
 }
 
 fn run_rdp_session(
-    config: RdpConfig,
+    mut config: RdpConfig,
     control_rx: mpsc::Receiver<ClientEvent>,
     server_tx: tokio_mpsc::Sender<ServerEvent>,
 ) -> anyhow::Result<()> {
-    server_tx
-        .blocking_send(ServerEvent::Status(ServerStatus::Connecting))
-        .ok();
+    for redirect_count in 0..=MAX_SERVER_REDIRECTS {
+        server_tx
+            .blocking_send(ServerEvent::Status(ServerStatus::Connecting))
+            .ok();
 
-    let connector_config = build_connector_config(&config)?;
-    let (connection_result, framed) = connect(
-        connector_config,
-        config.host.clone(),
-        config.port,
-        server_tx.clone(),
-    )
-    .context("connect RDP")?;
-    let width = connection_result.desktop_size.width;
-    let height = connection_result.desktop_size.height;
+        let connector_config = build_connector_config(&config)?;
+        let connect_read_timeout = connect_read_timeout_for_mode(config.mode);
+        let (connection_result, framed) = connect(
+            connector_config,
+            &config,
+            config.host.clone(),
+            config.port,
+            server_tx.clone(),
+            connect_read_timeout,
+        )
+        .context("connect RDP")?;
+        let width = connection_result.desktop_size.width;
+        let height = connection_result.desktop_size.height;
 
-    server_tx
-        .blocking_send(ServerEvent::Status(ServerStatus::Connected))
-        .ok();
+        server_tx
+            .blocking_send(ServerEvent::Status(ServerStatus::Connected))
+            .ok();
 
-    let image = DecodedImage::new(
-        ironrdp_graphics::image_processing::PixelFormat::RgbA32,
-        width,
-        height,
-    );
+        let image = DecodedImage::new(
+            ironrdp_graphics::image_processing::PixelFormat::RgbA32,
+            width,
+            height,
+        );
 
-    drive_active_session(connection_result, framed, image, control_rx)
+        match drive_active_session(connection_result, framed, image, &control_rx)? {
+            ActiveSessionOutcome::Closed => return Ok(()),
+            ActiveSessionOutcome::Redirect(redirection) => {
+                if redirect_count == MAX_SERVER_REDIRECTS {
+                    bail!("RDP server redirected too many times");
+                }
+                info!(
+                    redirect = redirect_count + 1,
+                    has_username = redirection.username.is_some(),
+                    has_password = redirection.password.is_some(),
+                    has_domain = redirection.domain.is_some(),
+                    "following RDP server redirection"
+                );
+                apply_server_redirection(&mut config, redirection);
+            }
+        }
+    }
+
+    bail!("RDP server redirected too many times")
 }
 
 fn build_connector_config(config: &RdpConfig) -> anyhow::Result<connector::Config> {
     let codecs = client_codecs_capabilities(&["remotefx"]).map_err(|err| anyhow::anyhow!(err))?;
+    let is_session_mode = config.mode == RdpMode::Session;
 
     Ok(connector::Config {
         credentials: Credentials::UsernamePassword {
@@ -413,8 +471,13 @@ fn build_connector_config(config: &RdpConfig) -> anyhow::Result<connector::Confi
             password: config.password.clone(),
         },
         domain: config.domain.clone(),
-        enable_tls: false,
+        request_data: config
+            .routing_token
+            .as_ref()
+            .map(|token| ironrdp_pdu::nego::NegoRequestData::routing_token(token.clone())),
+        enable_tls: is_session_mode,
         enable_credssp: true,
+        enable_rdstls: is_session_mode && config.routing_token.is_some(),
         keyboard_type: KeyboardType::IbmEnhanced,
         keyboard_subtype: 0,
         keyboard_layout: 0,
@@ -433,27 +496,9 @@ fn build_connector_config(config: &RdpConfig) -> anyhow::Result<connector::Confi
         client_build: 0,
         client_name: "rdp2web".to_owned(),
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
-        #[cfg(windows)]
-        platform: MajorPlatformType::WINDOWS,
-        #[cfg(target_os = "macos")]
-        platform: MajorPlatformType::MACINTOSH,
-        #[cfg(target_os = "ios")]
-        platform: MajorPlatformType::IOS,
-        #[cfg(target_os = "linux")]
-        platform: MajorPlatformType::UNIX,
-        #[cfg(target_os = "android")]
-        platform: MajorPlatformType::ANDROID,
-        #[cfg(target_os = "freebsd")]
-        platform: MajorPlatformType::UNIX,
-        #[cfg(target_os = "dragonfly")]
-        platform: MajorPlatformType::UNIX,
-        #[cfg(target_os = "openbsd")]
-        platform: MajorPlatformType::UNIX,
-        #[cfg(target_os = "netbsd")]
-        platform: MajorPlatformType::UNIX,
+        platform: platform_for_mode(config.mode),
         enable_server_pointer: true,
-        request_data: None,
-        autologon: false,
+        autologon: is_session_mode,
         enable_audio_playback: false,
         compression_type: Some(CompressionType::Rdp61),
         pointer_software_rendering: false,
@@ -468,14 +513,68 @@ fn build_connector_config(config: &RdpConfig) -> anyhow::Result<connector::Confi
     })
 }
 
-type UpgradedFramed =
-    ironrdp_blocking::Framed<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
+fn platform_for_mode(mode: RdpMode) -> MajorPlatformType {
+    if mode == RdpMode::Session {
+        // GNOME Remote Login hands non-RDSTLS Windows clients back to the
+        // original system credentials during server redirection.
+        return MajorPlatformType::WINDOWS;
+    }
+
+    default_platform()
+}
+
+#[cfg(windows)]
+fn default_platform() -> MajorPlatformType {
+    MajorPlatformType::WINDOWS
+}
+
+#[cfg(target_os = "macos")]
+fn default_platform() -> MajorPlatformType {
+    MajorPlatformType::MACINTOSH
+}
+
+#[cfg(target_os = "ios")]
+fn default_platform() -> MajorPlatformType {
+    MajorPlatformType::IOS
+}
+
+#[cfg(target_os = "linux")]
+fn default_platform() -> MajorPlatformType {
+    MajorPlatformType::UNIX
+}
+
+#[cfg(target_os = "android")]
+fn default_platform() -> MajorPlatformType {
+    MajorPlatformType::ANDROID
+}
+
+#[cfg(any(
+    target_os = "freebsd",
+    target_os = "dragonfly",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+fn default_platform() -> MajorPlatformType {
+    MajorPlatformType::UNIX
+}
+
+fn connect_read_timeout_for_mode(mode: RdpMode) -> Duration {
+    match mode {
+        RdpMode::Shared => SHARED_CONNECT_READ_TIMEOUT,
+        RdpMode::Session => SESSION_CONNECT_READ_TIMEOUT,
+    }
+}
+
+type UpgradedStream = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+type UpgradedFramed = ironrdp_blocking::Framed<UpgradedStream>;
 
 fn connect(
     config: connector::Config,
+    rdp_config: &RdpConfig,
     server_name: String,
     port: u16,
     server_tx: tokio_mpsc::Sender<ServerEvent>,
+    connect_read_timeout: Duration,
 ) -> anyhow::Result<(ConnectionResult, UpgradedFramed)> {
     install_default_crypto_provider();
 
@@ -488,21 +587,30 @@ fn connect(
 
     let tcp_stream = TcpStream::connect(server_addr).context("TCP connect")?;
     tcp_stream
-        .set_read_timeout(Some(CONNECT_READ_TIMEOUT))
+        .set_read_timeout(Some(connect_read_timeout))
         .context("set RDP connect read timeout")?;
 
     let client_addr = tcp_stream.local_addr().context("get TCP local address")?;
     let mut framed = ironrdp_blocking::Framed::new(tcp_stream);
     let graphics = GraphicsPipelineClient::new(Box::new(EgfxHandler::new(server_tx)), None);
-    let drdynvc = DrdynvcClient::new().with_dynamic_channel(graphics);
+    let display_control = DisplayControlClient::new(|_| Ok(Vec::new()));
+    let drdynvc = DrdynvcClient::new()
+        .with_dynamic_channel(graphics)
+        .with_dynamic_channel(display_control);
     let mut connector =
         connector::ClientConnector::new(config, client_addr).with_static_channel(drdynvc);
     let should_upgrade = ironrdp_blocking::connect_begin(&mut framed, &mut connector)
         .context("begin RDP connect")?;
 
     let initial_stream = framed.into_inner_no_leftover();
-    let (upgraded_stream, server_public_key) =
+    let (mut upgraded_stream, server_public_key) =
         tls_upgrade(initial_stream, server_name.clone()).context("TLS upgrade")?;
+    if selected_protocol_from_connector(&connector)
+        .is_some_and(|protocol| protocol.contains(ironrdp_pdu::nego::SecurityProtocol::RDSTLS))
+    {
+        perform_rdstls_authentication(&mut upgraded_stream, rdp_config)
+            .context("RDSTLS authentication")?;
+    }
     let upgraded = ironrdp_blocking::mark_as_upgraded(should_upgrade, &mut connector);
     let mut upgraded_framed = ironrdp_blocking::Framed::new(upgraded_stream);
     let mut network_client = ReqwestNetworkClient;
@@ -526,6 +634,163 @@ fn connect(
     Ok((connection_result, upgraded_framed))
 }
 
+fn selected_protocol_from_connector(
+    connector: &connector::ClientConnector,
+) -> Option<ironrdp_pdu::nego::SecurityProtocol> {
+    match connector.state {
+        connector::ClientConnectorState::EnhancedSecurityUpgrade { selected_protocol } => {
+            Some(selected_protocol)
+        }
+        _ => None,
+    }
+}
+
+fn perform_rdstls_authentication(
+    stream: &mut UpgradedStream,
+    config: &RdpConfig,
+) -> anyhow::Result<()> {
+    let auth = config
+        .redirection_auth
+        .as_ref()
+        .context("RDP server selected RDSTLS without redirected authentication data")?;
+    let password = auth
+        .password
+        .as_deref()
+        .context("RDP server selected RDSTLS but did not provide a redirected password")?;
+
+    read_rdstls_capabilities(stream)?;
+
+    let username = auth.username.as_deref().unwrap_or(&config.username);
+    let domain = auth.domain.as_deref().or(config.domain.as_deref());
+    let redirection_guid = auth.redirection_guid.as_deref().unwrap_or(&[]);
+    let request = rdstls_authentication_request(username, domain, redirection_guid, password)?;
+    stream
+        .write_all(&request)
+        .context("write RDSTLS authentication request")?;
+    stream
+        .flush()
+        .context("flush RDSTLS authentication request")?;
+
+    read_rdstls_authentication_response(stream)
+}
+
+fn read_rdstls_capabilities(stream: &mut UpgradedStream) -> anyhow::Result<()> {
+    let mut frame = [0u8; 8];
+    stream
+        .read_exact(&mut frame)
+        .context("read RDSTLS capabilities")?;
+
+    ensure_rdstls_header(&frame, RDSTLS_TYPE_CAPABILITIES)?;
+    let data_type = u16::from_le_bytes([frame[4], frame[5]]);
+    let supported_versions = u16::from_le_bytes([frame[6], frame[7]]);
+    if data_type != RDSTLS_DATA_CAPABILITIES {
+        bail!("RDSTLS capabilities used unsupported data type 0x{data_type:04x}");
+    }
+    if supported_versions & RDSTLS_VERSION_1 == 0 {
+        bail!("RDSTLS server did not advertise version 1 support");
+    }
+
+    Ok(())
+}
+
+fn rdstls_authentication_request(
+    username: &str,
+    domain: Option<&str>,
+    redirection_guid: &[u8],
+    password: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let mut frame = Vec::new();
+    push_u16_le(&mut frame, RDSTLS_VERSION_1);
+    push_u16_le(&mut frame, RDSTLS_TYPE_AUTHREQ);
+    push_u16_le(&mut frame, RDSTLS_DATA_PASSWORD_CREDS);
+    push_len_prefixed_bytes(&mut frame, redirection_guid, "RDSTLS redirection GUID")?;
+    push_len_prefixed_utf16(&mut frame, Some(username), "RDSTLS username")?;
+    push_len_prefixed_utf16(&mut frame, domain, "RDSTLS domain")?;
+    push_len_prefixed_bytes(&mut frame, password, "RDSTLS redirected password")?;
+    Ok(frame)
+}
+
+fn read_rdstls_authentication_response(stream: &mut UpgradedStream) -> anyhow::Result<()> {
+    let mut frame = [0u8; 10];
+    stream
+        .read_exact(&mut frame)
+        .context("read RDSTLS authentication response")?;
+
+    ensure_rdstls_header(&frame, RDSTLS_TYPE_AUTHRSP)?;
+    let data_type = u16::from_le_bytes([frame[4], frame[5]]);
+    if data_type != RDSTLS_DATA_RESULT_CODE {
+        bail!("RDSTLS authentication response used unsupported data type 0x{data_type:04x}");
+    }
+
+    let result = u32::from_le_bytes([frame[6], frame[7], frame[8], frame[9]]);
+    if result != RDSTLS_RESULT_SUCCESS {
+        bail!(
+            "RDSTLS authentication failed with {} (0x{result:08x})",
+            rdstls_result_name(result)
+        );
+    }
+
+    Ok(())
+}
+
+fn ensure_rdstls_header(frame: &[u8], expected_type: u16) -> anyhow::Result<()> {
+    let version = u16::from_le_bytes([frame[0], frame[1]]);
+    let pdu_type = u16::from_le_bytes([frame[2], frame[3]]);
+    if version != RDSTLS_VERSION_1 {
+        bail!("RDSTLS frame used unsupported version 0x{version:04x}");
+    }
+    if pdu_type != expected_type {
+        bail!("RDSTLS frame used unexpected PDU type 0x{pdu_type:04x}");
+    }
+    Ok(())
+}
+
+fn push_len_prefixed_utf16(
+    frame: &mut Vec<u8>,
+    value: Option<&str>,
+    field: &str,
+) -> anyhow::Result<()> {
+    let words = value
+        .unwrap_or("")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let len = words
+        .len()
+        .checked_mul(2)
+        .context("RDSTLS string length overflow")?;
+    let len = u16::try_from(len).with_context(|| format!("{field} is too long"))?;
+    push_u16_le(frame, len);
+    for word in words {
+        push_u16_le(frame, word);
+    }
+    Ok(())
+}
+
+fn push_len_prefixed_bytes(frame: &mut Vec<u8>, value: &[u8], field: &str) -> anyhow::Result<()> {
+    let len = u16::try_from(value.len()).with_context(|| format!("{field} is too long"))?;
+    push_u16_le(frame, len);
+    frame.extend_from_slice(value);
+    Ok(())
+}
+
+fn push_u16_le(frame: &mut Vec<u8>, value: u16) {
+    frame.extend_from_slice(&value.to_le_bytes());
+}
+
+fn rdstls_result_name(result: u32) -> &'static str {
+    match result {
+        RDSTLS_RESULT_ACCESS_DENIED => "access denied",
+        RDSTLS_RESULT_LOGON_FAILURE => "logon failure",
+        RDSTLS_RESULT_INVALID_LOGON_HOURS => "invalid logon hours",
+        RDSTLS_RESULT_PASSWORD_EXPIRED => "password expired",
+        RDSTLS_RESULT_ACCOUNT_DISABLED => "account disabled",
+        RDSTLS_RESULT_PASSWORD_MUST_CHANGE => "password must change",
+        RDSTLS_RESULT_ACCOUNT_LOCKED_OUT => "account locked out",
+        _ => "unknown error",
+    }
+}
+
 fn install_default_crypto_provider() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
@@ -537,58 +802,85 @@ fn drive_active_session(
     connection_result: ConnectionResult,
     mut framed: UpgradedFramed,
     mut image: DecodedImage,
-    control_rx: mpsc::Receiver<ClientEvent>,
-) -> anyhow::Result<()> {
+    control_rx: &mpsc::Receiver<ClientEvent>,
+) -> anyhow::Result<ActiveSessionOutcome> {
+    let mut current_desktop_size = (
+        connection_result.desktop_size.width,
+        connection_result.desktop_size.height,
+    );
     let mut active_stage = ActiveStage::new(connection_result);
+    let mut pending_resize = None;
 
     loop {
         loop {
             match control_rx.try_recv() {
                 Ok(event) => match event {
                     ClientEvent::Resize { width, height } => {
-                        if let Some(result) =
-                            active_stage.encode_resize(width.into(), height.into(), None, None)
-                        {
-                            let frame = result.context("encode RDP resize")?;
-                            framed.write_all(&frame).context("write resize frame")?;
-                            flush_framed(&mut framed).context("flush resize frame")?;
-                        }
+                        pending_resize = Some((width, height));
+                    }
+                    ClientEvent::Refresh { width, height } => {
+                        write_static_pdu(
+                            &active_stage,
+                            &mut framed,
+                            ShareDataPdu::SuppressOutput(SuppressOutputPdu {
+                                desktop_rect: Some(full_desktop_rect(width, height)),
+                            }),
+                            "allow display updates",
+                        )?;
+                        write_static_pdu(
+                            &active_stage,
+                            &mut framed,
+                            ShareDataPdu::RefreshRectangle(refresh_rectangle(width, height)),
+                            "refresh rectangle",
+                        )?;
                     }
                     event => {
                         let events = slow_input_events_from_client(&event);
                         if events.is_empty() {
                             continue;
                         }
-                        let mut frame = WriteBuf::new();
-                        active_stage
-                            .encode_static(
-                                &mut frame,
-                                ShareDataPdu::Input(ironrdp_pdu::input::InputEventPdu(events)),
-                            )
-                            .context("encode RDP input")?;
-                        framed
-                            .write_all(frame.filled())
-                            .context("write RDP input frame")?;
-                        flush_framed(&mut framed).context("flush RDP input frame")?;
+                        write_static_pdu(
+                            &active_stage,
+                            &mut framed,
+                            ShareDataPdu::Input(ironrdp_pdu::input::InputEventPdu(events)),
+                            "input",
+                        )?;
                     }
                 },
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     debug!("websocket control channel closed; stopping RDP session");
-                    return Ok(());
+                    return Ok(ActiveSessionOutcome::Closed);
                 }
+            }
+        }
+
+        if let Some((width, height)) = pending_resize {
+            if current_desktop_size == (width, height) {
+                pending_resize = None;
+            } else if let Some(result) =
+                active_stage.encode_resize(width.into(), height.into(), None, None)
+            {
+                let frame = result.context("encode RDP resize")?;
+                framed.write_all(&frame).context("write resize frame")?;
+                flush_framed(&mut framed).context("flush resize frame")?;
+                current_desktop_size = (width, height);
+                pending_resize = None;
             }
         }
 
         match framed.read_pdu() {
             Ok((action, payload)) => {
                 trace!(?action, frame_length = payload.len(), "RDP frame received");
+                if let Some(redirection) = server_redirection_from_frame(&payload)? {
+                    return Ok(ActiveSessionOutcome::Redirect(redirection));
+                }
                 let outputs = active_stage
                     .process(&mut image, action, &payload)
                     .context("process RDP frame")?;
                 if !write_outputs(outputs, &mut framed)? {
                     debug!("websocket receiver closed; stopping RDP session");
-                    return Ok(());
+                    return Ok(ActiveSessionOutcome::Closed);
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -596,6 +888,296 @@ fn drive_active_session(
             Err(err) => bail!("read RDP frame: {err}"),
         }
     }
+}
+
+fn refresh_rectangle(width: u16, height: u16) -> RefreshRectanglePdu {
+    RefreshRectanglePdu {
+        areas_to_refresh: vec![full_desktop_rect(width, height)],
+    }
+}
+
+fn full_desktop_rect(width: u16, height: u16) -> InclusiveRectangle {
+    InclusiveRectangle {
+        left: 0,
+        top: 0,
+        right: width.saturating_sub(1),
+        bottom: height.saturating_sub(1),
+    }
+}
+
+fn write_static_pdu(
+    active_stage: &ActiveStage,
+    framed: &mut UpgradedFramed,
+    pdu: ShareDataPdu,
+    name: &'static str,
+) -> anyhow::Result<()> {
+    let mut frame = WriteBuf::new();
+    active_stage
+        .encode_static(&mut frame, pdu)
+        .with_context(|| format!("encode RDP {name} frame"))?;
+    framed
+        .write_all(frame.filled())
+        .with_context(|| format!("write RDP {name} frame"))?;
+    flush_framed(framed).with_context(|| format!("flush RDP {name} frame"))?;
+    Ok(())
+}
+
+enum ActiveSessionOutcome {
+    Closed,
+    Redirect(ServerRedirection),
+}
+
+#[derive(Debug)]
+struct ServerRedirection {
+    routing_token: String,
+    username: Option<String>,
+    password: Option<String>,
+    domain: Option<String>,
+    redirection_auth: Option<RdpRedirectionAuth>,
+}
+
+fn apply_server_redirection(config: &mut RdpConfig, redirection: ServerRedirection) {
+    config.routing_token = Some(redirection.routing_token);
+
+    if config.mode == RdpMode::Session {
+        // Keep the configured login credentials for the normal Client Info
+        // PDU, but use the raw redirected fields for RDSTLS handoff auth.
+        config.redirection_auth = redirection.redirection_auth;
+        return;
+    }
+
+    if let Some(username) = redirection.username {
+        config.username = username;
+    }
+    if let Some(password) = redirection.password {
+        config.password = password;
+    }
+    if redirection.domain.is_some() {
+        config.domain = redirection.domain;
+    }
+}
+
+fn server_redirection_from_frame(frame: &[u8]) -> anyhow::Result<Option<ServerRedirection>> {
+    if frame.first().copied() != Some(3) {
+        return Ok(None);
+    }
+
+    let data_ctx = match connector::legacy::decode_send_data_indication(frame) {
+        Ok(data_ctx) => data_ctx,
+        Err(err) => {
+            trace!(%err, "ignoring non-redirection RDP frame");
+            return Ok(None);
+        }
+    };
+    let user_data = data_ctx.user_data;
+    if user_data.len() < 6 {
+        return Ok(None);
+    }
+
+    let total_length = usize::from(u16::from_le_bytes([user_data[0], user_data[1]]));
+    let pdu_type_with_version = u16::from_le_bytes([user_data[2], user_data[3]]);
+    if pdu_type_with_version & 0x000f != 0x000a {
+        return Ok(None);
+    }
+
+    let end = total_length.min(user_data.len());
+    parse_server_redirection(&user_data[6..end]).map(Some)
+}
+
+fn parse_server_redirection(data: &[u8]) -> anyhow::Result<ServerRedirection> {
+    const LB_TARGET_NET_ADDRESS: u32 = 0x0000_0001;
+    const LB_LOAD_BALANCE_INFO: u32 = 0x0000_0002;
+    const LB_USERNAME: u32 = 0x0000_0004;
+    const LB_DOMAIN: u32 = 0x0000_0008;
+    const LB_PASSWORD: u32 = 0x0000_0010;
+    const LB_TARGET_FQDN: u32 = 0x0000_0100;
+    const LB_TARGET_NETBIOS_NAME: u32 = 0x0000_0200;
+    const LB_CLIENT_TSV_URL: u32 = 0x0000_1000;
+    const LB_PASSWORD_IS_PK_ENCRYPTED: u32 = 0x0000_4000;
+    const LB_REDIRECTION_GUID: u32 = 0x0000_8000;
+
+    let data = if data.len() >= 4 && u16::from_le_bytes([data[2], data[3]]) == 0x0400 {
+        &data[2..]
+    } else {
+        data
+    };
+
+    let mut cursor = ByteCursor::new(data);
+    let _flags = cursor.read_u16("server redirection flags")?;
+    let length = usize::from(cursor.read_u16("server redirection length")?);
+    let packet_len = length.min(data.len());
+    let mut cursor = ByteCursor::new(&data[..packet_len]);
+
+    let _flags = cursor.read_u16("server redirection flags")?;
+    let _length = cursor.read_u16("server redirection length")?;
+    let _session_id = cursor.read_u32("server redirection session ID")?;
+    let redir_flags = cursor.read_u32("server redirection flags")?;
+
+    if redir_flags & LB_TARGET_NET_ADDRESS != 0 {
+        let _ = cursor.read_unicode_string("redirection target net address")?;
+    }
+
+    let routing_token = if redir_flags & LB_LOAD_BALANCE_INFO != 0 {
+        let load_balance_info = cursor.read_bytes_with_u32_len("redirection load balance info")?;
+        routing_token_from_load_balance_info(load_balance_info)
+    } else {
+        None
+    }
+    .with_context(|| {
+        format!(
+            "RDP server redirection did not include a routing token; redir_flags=0x{redir_flags:08x}; packet={}",
+            hex_preview(data, 96)
+        )
+    })?;
+
+    let username = if redir_flags & LB_USERNAME != 0 {
+        Some(cursor.read_unicode_string("redirection username")?)
+    } else {
+        None
+    };
+    let domain = if redir_flags & LB_DOMAIN != 0 {
+        Some(cursor.read_unicode_string("redirection domain")?)
+    } else {
+        None
+    };
+    let password_bytes = if redir_flags & LB_PASSWORD != 0 {
+        Some(
+            cursor
+                .read_bytes_with_u32_len("redirection password")?
+                .to_vec(),
+        )
+    } else {
+        None
+    };
+    let password =
+        if redir_flags & LB_PASSWORD != 0 && redir_flags & LB_PASSWORD_IS_PK_ENCRYPTED == 0 {
+            password_bytes
+                .as_deref()
+                .map(|bytes| utf16_string_from_bytes(bytes, "redirection password"))
+                .transpose()?
+        } else {
+            None
+        };
+
+    if redir_flags & LB_TARGET_FQDN != 0 {
+        let _ = cursor.read_unicode_string("redirection target FQDN")?;
+    }
+    if redir_flags & LB_TARGET_NETBIOS_NAME != 0 {
+        let _ = cursor.read_unicode_string("redirection target NetBIOS name")?;
+    }
+    if redir_flags & LB_CLIENT_TSV_URL != 0 {
+        let _ = cursor.read_bytes_with_u32_len("redirection client TSV URL")?;
+    }
+    let redirection_guid = if redir_flags & LB_REDIRECTION_GUID != 0 {
+        Some(cursor.read_bytes_with_u32_len("redirection GUID")?.to_vec())
+    } else {
+        None
+    };
+
+    let username = username.filter(|value| !value.is_empty());
+    let domain = domain.filter(|value| !value.is_empty());
+    let password = password.filter(|value| !value.is_empty());
+    let redirection_auth = if password_bytes.is_some() || redirection_guid.is_some() {
+        Some(RdpRedirectionAuth {
+            flags: redir_flags,
+            username: username.clone(),
+            domain: domain.clone(),
+            password: password_bytes,
+            redirection_guid,
+        })
+    } else {
+        None
+    };
+
+    Ok(ServerRedirection {
+        routing_token,
+        username,
+        password,
+        domain,
+        redirection_auth,
+    })
+}
+
+fn routing_token_from_load_balance_info(data: &[u8]) -> Option<String> {
+    let value = String::from_utf8_lossy(data);
+    let value = value.trim_end_matches(|ch| matches!(ch, '\r' | '\n' | '\0'));
+    let token = value
+        .strip_prefix("Cookie: msts=")
+        .or_else(|| value.strip_prefix("Cookie: MSTS="))
+        .or_else(|| value.strip_prefix("msts="))
+        .unwrap_or(value)
+        .trim()
+        .to_owned();
+
+    if token.is_empty() { None } else { Some(token) }
+}
+
+fn hex_preview(data: &[u8], max_len: usize) -> String {
+    data.iter()
+        .take(max_len)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+struct ByteCursor<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ByteCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
+    }
+
+    fn read_u16(&mut self, field: &str) -> anyhow::Result<u16> {
+        let bytes = self.read_exact(2, field)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self, field: &str) -> anyhow::Result<u32> {
+        let bytes = self.read_exact(4, field)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_bytes_with_u32_len(&mut self, field: &str) -> anyhow::Result<&'a [u8]> {
+        let len = usize::try_from(self.read_u32(field)?).context("redirection length overflow")?;
+        self.read_exact(len, field)
+    }
+
+    fn read_unicode_string(&mut self, field: &str) -> anyhow::Result<String> {
+        let bytes = self.read_bytes_with_u32_len(field)?;
+        utf16_string_from_bytes(bytes, field)
+    }
+
+    fn read_exact(&mut self, len: usize, field: &str) -> anyhow::Result<&'a [u8]> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .with_context(|| format!("{field} length overflow"))?;
+        let bytes = self
+            .data
+            .get(self.offset..end)
+            .with_context(|| format!("redirection packet is missing {field}"))?;
+        self.offset = end;
+        Ok(bytes)
+    }
+}
+
+fn utf16_string_from_bytes(bytes: &[u8], field: &str) -> anyhow::Result<String> {
+    if bytes.len() % 2 != 0 {
+        bail!("{field} has an odd UTF-16 byte length");
+    }
+
+    let mut words = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        let word = u16::from_le_bytes([chunk[0], chunk[1]]);
+        if word == 0 {
+            break;
+        }
+        words.push(word);
+    }
+    String::from_utf16(&words).with_context(|| format!("decode {field}"))
 }
 
 fn write_outputs(
@@ -803,6 +1385,14 @@ mod tests {
 
         assert_eq!(&packet[..2], &[1, 1]);
         assert_eq!(&packet[2..], &[0, 0, 0, 1, 0x65]);
+    }
+
+    #[test]
+    fn redirection_detector_ignores_non_tpkt_frames() {
+        let result =
+            server_redirection_from_frame(&[0, 0, 0, 0]).expect("non-TPKT frame is not fatal");
+
+        assert!(result.is_none());
     }
 
     #[test]

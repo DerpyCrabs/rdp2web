@@ -37,9 +37,8 @@
       }
 
       .shell {
-        display: grid;
-        grid-template-rows: auto 1fr;
-        min-height: 100%;
+        display: block;
+        min-height: 100vh;
       }
 
       header {
@@ -48,24 +47,19 @@
         border-bottom: 1px solid var(--border);
         display: flex;
         gap: 12px;
+        left: 0;
         min-height: 48px;
         padding: 8px 12px;
-      }
-
-      .shell.connected {
-        display: block;
-        min-height: 100%;
-      }
-
-      .shell.connected header {
-        left: 0;
-        opacity: 0.18;
         position: fixed;
         right: 0;
         top: 0;
+        z-index: 10;
+      }
+
+      .shell.connected header {
+        opacity: 0.18;
         transform: translateY(calc(-100% + 6px));
         transition: opacity 120ms ease, transform 120ms ease;
-        z-index: 10;
       }
 
       .shell.connected header:hover,
@@ -74,7 +68,12 @@
         transform: translateY(0);
       }
 
-      .shell.connected main {
+      .shell.has-error header {
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      main {
         height: 100vh;
       }
 
@@ -116,38 +115,65 @@
         align-items: center;
         display: inline-flex;
         gap: 6px;
+        flex: 0 0 auto;
       }
 
       .size-controls[hidden] {
         display: none;
       }
 
-      .size-field {
-        align-items: center;
-        color: var(--muted);
-        display: inline-flex;
-        gap: 4px;
-      }
-
-      input[type="number"] {
+      select {
         background: var(--panel-2);
         border: 1px solid var(--border);
         border-radius: 6px;
         color: var(--text);
         font: inherit;
         height: 32px;
+        min-width: 118px;
         padding: 0 8px;
-        width: 86px;
       }
 
-      input[type="number"]:disabled {
+      select:disabled {
         color: var(--muted);
       }
 
-      main {
-        min-height: 0;
-        overflow: hidden;
-        position: relative;
+      .icon-button {
+        align-items: center;
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        color: var(--text);
+        cursor: pointer;
+        display: inline-flex;
+        height: 32px;
+        justify-content: center;
+        padding: 0;
+        width: 32px;
+      }
+
+      .icon-button:disabled {
+        color: var(--muted);
+        cursor: default;
+      }
+
+      .icon-button:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+
+      .fullscreen-icon {
+        background:
+          linear-gradient(currentColor, currentColor) left top / 7px 2px no-repeat,
+          linear-gradient(currentColor, currentColor) left top / 2px 7px no-repeat,
+          linear-gradient(currentColor, currentColor) right top / 7px 2px no-repeat,
+          linear-gradient(currentColor, currentColor) right top / 2px 7px no-repeat,
+          linear-gradient(currentColor, currentColor) left bottom / 7px 2px no-repeat,
+          linear-gradient(currentColor, currentColor) left bottom / 2px 7px no-repeat,
+          linear-gradient(currentColor, currentColor) right bottom / 7px 2px no-repeat,
+          linear-gradient(currentColor, currentColor) right bottom / 2px 7px no-repeat;
+        display: block;
+        height: 16px;
+        width: 16px;
       }
 
       .stage {
@@ -190,8 +216,17 @@
         <div id="fps" class="metrics">0 fps</div>
         <div id="status" class="status">Disconnected</div>
         <div id="resolution" class="size-controls" hidden>
-          <label class="size-field">W <input id="width" type="number" min="200" max="32766" step="1"></label>
-          <label class="size-field">H <input id="height" type="number" min="200" max="32766" step="1"></label>
+          <select id="resolutionPreset" aria-label="Resolution">
+            <option value="auto">Auto</option>
+            <option value="1280x720">1280x720</option>
+            <option value="1366x768">1366x768</option>
+            <option value="1600x900">1600x900</option>
+            <option value="1920x1080">1920x1080</option>
+            <option value="2560x1440">2560x1440</option>
+          </select>
+          <button id="fullscreenToggle" class="icon-button" type="button" aria-label="Enter fullscreen" title="Fullscreen">
+            <span class="fullscreen-icon" aria-hidden="true"></span>
+          </button>
         </div>
       </header>
       <main>
@@ -212,13 +247,12 @@
       const fpsEl = document.getElementById("fps");
       const emptyEl = document.getElementById("empty");
       const resolutionEl = document.getElementById("resolution");
-      const widthInput = document.getElementById("width");
-      const heightInput = document.getElementById("height");
+      const resolutionPreset = document.getElementById("resolutionPreset");
+      const fullscreenToggle = document.getElementById("fullscreenToggle");
 
       let socket = null;
       let rdpReady = false;
       let retryTimer = null;
-      let sawDesktopSize = false;
       let codec = "";
       let decoder = null;
       let pendingFrame = null;
@@ -226,16 +260,24 @@
       let fpsFrames = 0;
       let fpsStartedAt = 0;
       let fpsLastFrameAt = 0;
+      let autoResizeTimer = null;
+      let defaultSize = { width: 1280, height: 720 };
 
       function setStatus(text, kind = "") {
         statusEl.textContent = text;
         statusEl.className = `status ${kind}`.trim();
+        shellEl.classList.toggle("has-error", kind === "error");
       }
 
-      function setFallbackSizeVisible(value) {
+      function syncSizeControlState() {
+        const enabled = !resolutionEl.hidden;
+        resolutionPreset.disabled = !enabled;
+        fullscreenToggle.disabled = !enabled || !document.fullscreenEnabled;
+      }
+
+      function setSizeControlsVisible(value) {
         resolutionEl.hidden = !value;
-        widthInput.disabled = !value;
-        heightInput.disabled = !value;
+        syncSizeControlState();
       }
 
       function resetFps() {
@@ -269,7 +311,9 @@
       function setReady(value) {
         rdpReady = value;
         shellEl.classList.toggle("connected", value);
-        setFallbackSizeVisible(false);
+        if (value && resolutionPreset.value === "auto") {
+          scheduleAutoResize(0);
+        }
       }
 
       function send(payload) {
@@ -300,12 +344,14 @@
       function setupCodec(video) {
         closeDecoder();
         if (typeof VideoDecoder !== "function" || typeof EncodedVideoChunk !== "function") {
+          setReady(false);
           setStatus("WebCodecs unavailable", "error");
           return;
         }
 
         const h264 = video && video.h264;
         if (!h264) {
+          setReady(false);
           setStatus("No H.264 stream", "error");
           return;
         }
@@ -322,7 +368,10 @@
         if (!decoder || decoder.state === "closed") {
           decoder = new VideoDecoder({
             output: renderVideoFrame,
-            error: (error) => setStatus(error.message, "error")
+            error: (error) => {
+              setReady(false);
+              setStatus(error.message, "error");
+            }
           });
         }
         if (decoder.state !== "configured") {
@@ -429,10 +478,103 @@
       }
 
       function setDesktopSize(width, height) {
-        sawDesktopSize = true;
-        widthInput.value = width;
-        heightInput.value = height;
         setStatus(`${width}x${height}`, "connected");
+      }
+
+      function clampSize(value) {
+        return Math.max(200, Math.min(32766, Math.floor(value)));
+      }
+
+      function selectedSize() {
+        if (resolutionPreset.value === "auto") {
+          return autoSize();
+        }
+
+        const match = resolutionPreset.value.match(/^(\d+)x(\d+)$/);
+        if (match) {
+          return {
+            width: clampSize(Number.parseInt(match[1], 10)),
+            height: clampSize(Number.parseInt(match[2], 10))
+          };
+        }
+
+        return {
+          width: defaultSize.width,
+          height: defaultSize.height
+        };
+      }
+
+      function autoSize() {
+        const dpr = window.devicePixelRatio || 1;
+        const cssWidth = stageEl.clientWidth || document.documentElement.clientWidth || window.innerWidth || defaultSize.width;
+        const cssHeight = stageEl.clientHeight || document.documentElement.clientHeight || window.innerHeight || defaultSize.height;
+        return {
+          width: clampSize(cssWidth * dpr),
+          height: clampSize(cssHeight * dpr)
+        };
+      }
+
+      function requestDesktopResize(width, height) {
+        const size = { width: clampSize(width), height: clampSize(height) };
+        if (rdpReady) {
+          send({ type: "resize", width: size.width, height: size.height });
+        } else if (!socket) {
+          connect();
+        }
+      }
+
+      function applyAutoResize() {
+        if (resolutionPreset.value !== "auto") return;
+        const size = autoSize();
+        requestDesktopResize(size.width, size.height);
+      }
+
+      function scheduleAutoResize(delay = 160) {
+        window.clearTimeout(autoResizeTimer);
+        autoResizeTimer = window.setTimeout(applyAutoResize, delay);
+      }
+
+      function refreshViewportSize(delay = 160) {
+        fitCanvas();
+        if (resolutionPreset.value === "auto") {
+          scheduleAutoResize(delay);
+        }
+      }
+
+      function applyResolutionPreset() {
+        const value = resolutionPreset.value;
+        syncSizeControlState();
+
+        if (value === "auto") {
+          scheduleAutoResize(0);
+          return;
+        }
+
+        const match = value.match(/^(\d+)x(\d+)$/);
+        if (match) {
+          requestDesktopResize(Number.parseInt(match[1], 10), Number.parseInt(match[2], 10));
+        }
+      }
+
+      function updateFullscreenToggle() {
+        const active = Boolean(document.fullscreenElement);
+        fullscreenToggle.disabled = !document.fullscreenEnabled;
+        fullscreenToggle.setAttribute("aria-label", active ? "Exit fullscreen" : "Enter fullscreen");
+        fullscreenToggle.title = active ? "Exit fullscreen" : "Fullscreen";
+      }
+
+      async function toggleFullscreen() {
+        if (!document.fullscreenEnabled) return;
+
+        try {
+          if (document.fullscreenElement) {
+            await document.exitFullscreen();
+          } else {
+            await shellEl.requestFullscreen();
+          }
+        } catch (error) {
+          setStatus(error && error.message ? error.message : "Fullscreen unavailable", "error");
+        }
       }
 
       function fitCanvas() {
@@ -457,13 +599,12 @@
         window.clearTimeout(retryTimer);
         setReady(false);
         resetFps();
-        setFallbackSizeVisible(false);
+        setSizeControlsVisible(true);
         emptyEl.hidden = false;
 
         const wsUrl = new URL("/ws/rdp", window.location.href);
         wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
-        const width = Number.parseInt(widthInput.value, 10);
-        const height = Number.parseInt(heightInput.value, 10);
+        const { width, height } = selectedSize();
         if (Number.isFinite(width) && width >= 200) wsUrl.searchParams.set("width", String(width));
         if (Number.isFinite(height) && height >= 200) wsUrl.searchParams.set("height", String(height));
         socket = new WebSocket(wsUrl);
@@ -477,6 +618,7 @@
         socket.addEventListener("message", async (event) => {
           if (event.data instanceof ArrayBuffer) {
             handleVideoPacket(event.data).catch((error) => {
+              setReady(false);
               setStatus(error.message, "error");
             });
             return;
@@ -491,13 +633,16 @@
           } else if (message.type === "desktop_size") {
             setDesktopSize(message.width, message.height);
           } else if (message.type === "connecting") {
+            setReady(false);
             setStatus("Connecting");
           } else if (message.type === "error") {
+            setReady(false);
             setStatus(message.message, "error");
-            setFallbackSizeVisible(!sawDesktopSize);
+            setSizeControlsVisible(true);
           } else if (message.type === "disconnected") {
+            setReady(false);
             setStatus(message.reason);
-            setFallbackSizeVisible(!sawDesktopSize);
+            setSizeControlsVisible(true);
           }
         });
 
@@ -506,13 +651,14 @@
           closeDecoder();
           setReady(false);
           setStatus("Reconnecting");
-          setFallbackSizeVisible(!sawDesktopSize);
+          setSizeControlsVisible(true);
           retryTimer = window.setTimeout(connect, 1500);
         });
 
         socket.addEventListener("error", () => {
+          setReady(false);
           setStatus("WebSocket error", "error");
-          setFallbackSizeVisible(!sawDesktopSize);
+          setSizeControlsVisible(true);
         });
       }
 
@@ -567,25 +713,32 @@
         send({ type: "key", down: false, code: event.code, key: event.key });
       });
       window.addEventListener("resize", () => {
-        fitCanvas();
+        refreshViewportSize();
       });
       window.setInterval(renderFps, 1000);
-      widthInput.addEventListener("change", () => {
-        if (!socket) connect();
+      resolutionPreset.addEventListener("change", applyResolutionPreset);
+      fullscreenToggle.addEventListener("click", toggleFullscreen);
+      document.addEventListener("fullscreenchange", () => {
+        updateFullscreenToggle();
+        refreshViewportSize(0);
       });
-      heightInput.addEventListener("change", () => {
-        if (!socket) connect();
+      document.addEventListener("fullscreenerror", () => {
+        setStatus("Fullscreen unavailable", "error");
       });
+      updateFullscreenToggle();
 
       fetch("/api/config")
         .then((response) => response.json())
         .then((config) => {
-          widthInput.value = config.default_width;
-          heightInput.value = config.default_height;
+          defaultSize = {
+            width: clampSize(config.default_width),
+            height: clampSize(config.default_height)
+          };
+          setSizeControlsVisible(true);
           connect();
         })
         .catch(() => {
-          setFallbackSizeVisible(true);
+          setSizeControlsVisible(true);
           setStatus("Config unavailable", "error");
         });
     </script>

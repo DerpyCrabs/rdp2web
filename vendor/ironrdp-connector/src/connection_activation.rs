@@ -308,9 +308,10 @@ fn create_client_confirm_active(
     use ironrdp_pdu::rdp::capability_sets::{
         BITMAP_CACHE_ENTRIES_NUM, Bitmap, BitmapCache, BitmapDrawingFlags, Brush, CacheDefinition, CacheEntry,
         ClientConfirmActive, CmdFlags, DemandActive, FrameAcknowledge, GLYPH_CACHE_NUM, General, GeneralExtraFlags,
-        GlyphCache, GlyphSupportLevel, Input, InputFlags, LargePointer, LargePointerSupportFlags, MultifragmentUpdate,
-        OffscreenBitmapCache, Order, OrderFlags, OrderSupportExFlags, Pointer, SERVER_CHANNEL_ID, Sound, SoundFlags,
-        SupportLevel, SurfaceCommands, VirtualChannel, VirtualChannelFlags, client_codecs_capabilities,
+        GlyphCache, GlyphSupportLevel, Input, InputFlags, LargePointer, LargePointerSupportFlags, MajorPlatformType,
+        MinorPlatformType, MultifragmentUpdate, OffscreenBitmapCache, Order, OrderFlags, OrderSupportExFlags, Pointer,
+        SERVER_CHANNEL_ID, Sound, SoundFlags, SupportLevel, SurfaceCommands, VirtualChannel, VirtualChannelFlags,
+        client_codecs_capabilities,
     };
 
     server_capability_sets.retain(|capability_set| matches!(capability_set, CapabilitySet::MultiFragmentUpdate(_)));
@@ -332,6 +333,11 @@ fn create_client_confirm_active(
     server_capability_sets.extend_from_slice(&[
         CapabilitySet::General(General {
             major_platform_type: config.platform,
+            minor_platform_type: if config.platform == MajorPlatformType::WINDOWS {
+                MinorPlatformType::WINDOWS_NT
+            } else {
+                MinorPlatformType::UNSPECIFIED
+            },
             extra_flags: GeneralExtraFlags::FASTPATH_OUTPUT_SUPPORTED | GeneralExtraFlags::NO_BITMAP_COMPRESSION_HDR,
             ..Default::default()
         }),

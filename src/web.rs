@@ -1,5 +1,5 @@
-use crate::config::AppConfig;
-use crate::rdp::{ClientEvent, ServerEvent, encode_video_frame, start_rdp_session};
+use crate::config::{AppConfig, RdpMode};
+use crate::rdp::{ClientEvent, ServerEvent, ServerStatus, encode_video_frame, start_rdp_session};
 use anyhow::Context;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -16,20 +16,39 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::{self, ServerConfig};
 use tokio_rustls::server::TlsStream;
 use tower_http::trace::TraceLayer;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 const DIRECT_VIDEO_MEDIA: &str = r#"{"type":"media","video":{"h264":{"format":"annexb"}}}"#;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const SAVED_SESSION_EVENT_BUFFER: usize = 256;
+const RDP_RECONNECT_NUDGE_DELAY: Duration = Duration::from_millis(300);
 
 #[derive(Clone)]
 struct AppState {
     config: Arc<AppConfig>,
+    saved_session: Arc<Mutex<Option<Arc<SavedRdpSession>>>>,
+}
+
+struct SavedRdpSession {
+    control_tx: std::sync::mpsc::Sender<ClientEvent>,
+    events_tx: broadcast::Sender<ServerEvent>,
+    snapshot_rx: watch::Receiver<RdpSessionSnapshot>,
+    done_rx: watch::Receiver<bool>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RdpSessionSnapshot {
+    connecting: bool,
+    connected: bool,
+    desktop_size: Option<(u32, u32)>,
+    error: Option<String>,
+    disconnected: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -173,6 +192,7 @@ pub fn app(config: AppConfig) -> Router {
         .layer(TraceLayer::new_for_http())
         .with_state(AppState {
             config: Arc::new(config),
+            saved_session: Arc::new(Mutex::new(None)),
         })
 }
 
@@ -200,7 +220,7 @@ async fn rdp_ws(
 
     ws.max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
-        .on_upgrade(move |socket| handle_rdp_socket(socket, rdp_config))
+        .on_upgrade(move |socket| handle_rdp_socket(socket, state, rdp_config))
         .into_response()
 }
 
@@ -223,7 +243,19 @@ fn rdp_config_with_query(
     Ok(config)
 }
 
-async fn handle_rdp_socket(socket: WebSocket, rdp_config: crate::config::RdpConfig) {
+async fn handle_rdp_socket(
+    socket: WebSocket,
+    state: AppState,
+    rdp_config: crate::config::RdpConfig,
+) {
+    if rdp_config.mode == RdpMode::Session {
+        handle_saved_rdp_socket(socket, state, rdp_config).await;
+    } else {
+        handle_transient_rdp_socket(socket, rdp_config).await;
+    }
+}
+
+async fn handle_transient_rdp_socket(socket: WebSocket, rdp_config: crate::config::RdpConfig) {
     let (control_tx, mut server_rx) = start_rdp_session(rdp_config);
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -280,6 +312,252 @@ async fn handle_rdp_socket(socket: WebSocket, rdp_config: crate::config::RdpConf
     }
 }
 
+async fn handle_saved_rdp_socket(
+    socket: WebSocket,
+    state: AppState,
+    rdp_config: crate::config::RdpConfig,
+) {
+    let session = saved_session(&state, rdp_config.clone()).await;
+    let mut events_rx = session.events_tx.subscribe();
+    let snapshot = session.snapshot_rx.borrow().clone();
+    request_reconnect_size(
+        &session.control_tx,
+        &snapshot,
+        rdp_config.width,
+        rdp_config.height,
+    );
+    let control_tx = session.control_tx.clone();
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    let writer = tokio::spawn(async move {
+        ws_tx
+            .send(Message::Text(DIRECT_VIDEO_MEDIA.into()))
+            .await
+            .context("send direct-video media config")?;
+        send_saved_snapshot(&mut ws_tx, &snapshot).await?;
+
+        loop {
+            match events_rx.recv().await {
+                Ok(event) => {
+                    if let Err(err) = send_server_event(&mut ws_tx, event).await {
+                        debug!(%err, "websocket client closed while sending saved-session event");
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    debug!(
+                        skipped,
+                        "websocket client lagged behind saved RDP session events"
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+
+        anyhow::Ok(())
+    });
+
+    while let Some(message) = ws_rx.next().await {
+        match message {
+            Ok(Message::Text(text)) => match serde_json::from_str::<ClientEvent>(&text) {
+                Ok(event) => {
+                    if control_tx.send(event).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => warn!(%err, "ignoring invalid client event"),
+            },
+            Ok(Message::Close(_)) => break,
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Binary(_)) => {}
+            Err(err) => {
+                warn!(%err, "websocket receive error");
+                break;
+            }
+        }
+    }
+
+    writer.abort();
+    if let Err(err) = writer.await {
+        if !err.is_cancelled() {
+            error!(%err, "saved-session websocket writer task failed");
+        }
+    }
+}
+
+fn request_reconnect_size(
+    control_tx: &std::sync::mpsc::Sender<ClientEvent>,
+    snapshot: &RdpSessionSnapshot,
+    width: u16,
+    height: u16,
+) {
+    let current_size = snapshot.desktop_size.and_then(|(width, height)| {
+        Some((u16::try_from(width).ok()?, u16::try_from(height).ok()?))
+    });
+
+    if snapshot.connected && current_size == Some((width, height)) {
+        let nudge_width = nudge_width(width);
+        let _ = control_tx.send(ClientEvent::Resize {
+            width: nudge_width,
+            height,
+        });
+
+        let control_tx = control_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(RDP_RECONNECT_NUDGE_DELAY).await;
+            let _ = control_tx.send(ClientEvent::Resize { width, height });
+            let _ = control_tx.send(ClientEvent::Refresh { width, height });
+        });
+        return;
+    }
+
+    let _ = control_tx.send(ClientEvent::Resize { width, height });
+    let _ = control_tx.send(ClientEvent::Refresh { width, height });
+}
+
+fn nudge_width(width: u16) -> u16 {
+    if width > 202 { width - 2 } else { width + 2 }
+}
+
+async fn saved_session(
+    state: &AppState,
+    rdp_config: crate::config::RdpConfig,
+) -> Arc<SavedRdpSession> {
+    let mut saved_session = state.saved_session.lock().await;
+    if let Some(session) = saved_session.as_ref() {
+        if !*session.done_rx.borrow() {
+            return session.clone();
+        }
+    }
+
+    let (control_tx, mut server_rx) = start_rdp_session(rdp_config);
+    let (events_tx, _) = broadcast::channel(SAVED_SESSION_EVENT_BUFFER);
+    let (snapshot_tx, snapshot_rx) = watch::channel(RdpSessionSnapshot::default());
+    let (done_tx, done_rx) = watch::channel(false);
+    let session = Arc::new(SavedRdpSession {
+        control_tx,
+        events_tx: events_tx.clone(),
+        snapshot_rx,
+        done_rx,
+    });
+
+    tokio::spawn(async move {
+        let mut snapshot = RdpSessionSnapshot::default();
+        while let Some(event) = server_rx.recv().await {
+            match &event {
+                ServerEvent::Status(status) => {
+                    trace!(?status, "broadcasting saved RDP status event");
+                }
+                ServerEvent::Video(frame) => {
+                    trace!(
+                        key = frame.key,
+                        bytes = frame.data.len(),
+                        subscribers = events_tx.receiver_count(),
+                        "broadcasting saved RDP video event"
+                    );
+                }
+            }
+            update_saved_snapshot(&mut snapshot, &event);
+            let _ = snapshot_tx.send(snapshot.clone());
+            let _ = events_tx.send(event);
+        }
+        let _ = done_tx.send(true);
+    });
+
+    *saved_session = Some(session.clone());
+    session
+}
+
+fn update_saved_snapshot(snapshot: &mut RdpSessionSnapshot, event: &ServerEvent) {
+    match event {
+        ServerEvent::Status(ServerStatus::Connecting) => {
+            snapshot.connecting = true;
+            snapshot.connected = false;
+            snapshot.error = None;
+            snapshot.disconnected = None;
+        }
+        ServerEvent::Status(ServerStatus::Connected) => {
+            snapshot.connecting = false;
+            snapshot.connected = true;
+            snapshot.error = None;
+            snapshot.disconnected = None;
+        }
+        ServerEvent::Status(ServerStatus::DesktopSize { width, height }) => {
+            snapshot.desktop_size = Some((*width, *height));
+        }
+        ServerEvent::Status(ServerStatus::Disconnected { reason }) => {
+            snapshot.connecting = false;
+            snapshot.connected = false;
+            snapshot.disconnected = Some(reason.clone());
+        }
+        ServerEvent::Status(ServerStatus::Error { message }) => {
+            snapshot.connecting = false;
+            snapshot.connected = false;
+            snapshot.error = Some(message.clone());
+        }
+        ServerEvent::Video(_) => {}
+    }
+}
+
+async fn send_saved_snapshot(
+    ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    snapshot: &RdpSessionSnapshot,
+) -> anyhow::Result<()> {
+    if let Some(message) = &snapshot.error {
+        send_server_event(
+            ws_tx,
+            ServerEvent::Status(ServerStatus::Error {
+                message: message.clone(),
+            }),
+        )
+        .await?;
+    } else if snapshot.connected {
+        send_server_event(ws_tx, ServerEvent::Status(ServerStatus::Connected)).await?;
+        if let Some((width, height)) = snapshot.desktop_size {
+            send_server_event(
+                ws_tx,
+                ServerEvent::Status(ServerStatus::DesktopSize { width, height }),
+            )
+            .await?;
+        }
+    } else if let Some(reason) = &snapshot.disconnected {
+        send_server_event(
+            ws_tx,
+            ServerEvent::Status(ServerStatus::Disconnected {
+                reason: reason.clone(),
+            }),
+        )
+        .await?;
+    } else if snapshot.connecting {
+        send_server_event(ws_tx, ServerEvent::Status(ServerStatus::Connecting)).await?;
+    }
+
+    Ok(())
+}
+
+async fn send_server_event(
+    ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    event: ServerEvent,
+) -> anyhow::Result<()> {
+    match event {
+        ServerEvent::Status(status) => {
+            let payload = serde_json::to_string(&status)?;
+            ws_tx.send(Message::Text(payload.into())).await?;
+        }
+        ServerEvent::Video(frame) => {
+            trace!(
+                key = frame.key,
+                bytes = frame.data.len(),
+                "sending video frame to websocket"
+            );
+            ws_tx
+                .send(Message::Binary(encode_video_frame(&frame).into()))
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn readiness_probe(config: &AppConfig) -> anyhow::Result<()> {
     tokio::net::TcpStream::connect((config.rdp.host.as_str(), config.rdp.port))
         .await
@@ -308,6 +586,9 @@ mod tests {
                 username: "user".to_owned(),
                 password: "secret".to_owned(),
                 domain: None,
+                mode: crate::config::RdpMode::Shared,
+                routing_token: None,
+                redirection_auth: None,
                 width: 800,
                 height: 600,
             },
@@ -362,7 +643,11 @@ mod tests {
         assert!(html.contains("function renderFps()"));
         assert!(html.contains("window.setInterval(renderFps, 1000)"));
         assert!(html.contains(r#".shell.connected header:hover"#));
+        assert!(html.contains(r#".shell.has-error header"#));
         assert!(html.contains(r#"shellEl.classList.toggle("connected", value)"#));
+        assert!(html.contains(r#"shellEl.classList.toggle("has-error", kind === "error")"#));
+        assert!(html.contains(r#"message.type === "error""#));
+        assert!(html.contains("setReady(false);"));
         assert!(html.contains("new VideoDecoder"));
         assert!(html.contains("new EncodedVideoChunk"));
         assert!(html.contains("function h264CodecFromAnnexB(data)"));
@@ -373,6 +658,18 @@ mod tests {
         assert!(!html.contains("R2W3"));
         assert!(!html.contains("42E01F"));
         assert!(html.contains(r#"<div id="resolution" class="size-controls" hidden>"#));
+        assert!(html.contains(r#"<select id="resolutionPreset""#));
+        assert!(html.contains(r#"<option value="auto">Auto</option>"#));
+        assert!(html.contains(r#"id="fullscreenToggle""#));
+        assert!(html.contains("requestFullscreen()"));
+        assert!(html.contains("document.exitFullscreen()"));
+        assert!(html.contains(r#""fullscreenchange""#));
+        assert!(!html.contains(r#"<option value="custom">Custom</option>"#));
+        assert!(!html.contains(r#"type="number""#));
+        assert!(html.contains("function applyAutoResize()"));
+        assert!(html.contains("stageEl.clientWidth || document.documentElement.clientWidth"));
+        assert!(html.contains("stageEl.clientHeight || document.documentElement.clientHeight"));
+        assert!(html.contains(r#"send({ type: "resize""#));
         assert!(html.contains("max-height: 100%;"));
         assert!(html.contains("max-width: 100%;"));
         assert!(html.contains("function fitCanvas()"));
@@ -380,7 +677,6 @@ mod tests {
         assert!(html.contains("1 / dpr"));
         assert!(html.contains(r#"wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";"#));
         assert!(html.contains("new WebSocket(wsUrl)"));
-        assert!(!html.contains(r#"type: "resize""#));
         assert!(!html.contains("Connect</button>"));
         assert!(!html.contains("Disconnect</button>"));
         assert!(!html.contains("rdp_host"));
@@ -401,5 +697,44 @@ mod tests {
         assert_eq!(config.height, 1440);
         assert_eq!(config.username, "user");
         assert_eq!(config.password, "secret");
+        assert_eq!(config.mode, crate::config::RdpMode::Shared);
+    }
+
+    #[test]
+    fn saved_session_snapshot_does_not_replay_video_history() {
+        let mut snapshot = RdpSessionSnapshot::default();
+
+        update_saved_snapshot(
+            &mut snapshot,
+            &ServerEvent::Video(crate::rdp::VideoFrame {
+                key: false,
+                data: vec![1],
+            }),
+        );
+
+        update_saved_snapshot(
+            &mut snapshot,
+            &ServerEvent::Video(crate::rdp::VideoFrame {
+                key: true,
+                data: vec![2, 3],
+            }),
+        );
+        update_saved_snapshot(
+            &mut snapshot,
+            &ServerEvent::Video(crate::rdp::VideoFrame {
+                key: false,
+                data: vec![4],
+            }),
+        );
+
+        assert!(!snapshot.connected);
+        assert!(snapshot.desktop_size.is_none());
+        assert!(snapshot.error.is_none());
+    }
+
+    #[test]
+    fn reconnect_nudge_keeps_rdp_width_even() {
+        assert_eq!(nudge_width(3840), 3838);
+        assert_eq!(nudge_width(200), 202);
     }
 }

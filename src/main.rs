@@ -3,8 +3,7 @@ use rdp2web::{config, web};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::from_filename(".env.local").ok();
-    dotenvy::dotenv().ok();
+    config::load_dotenv();
     init_tracing();
 
     let config = config::AppConfig::from_env().context("load configuration")?;

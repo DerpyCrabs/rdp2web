@@ -260,6 +260,14 @@ impl Sequence for ClientConnector {
                     security_protocol.insert(nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX);
                 }
 
+                if self.config.enable_rdstls {
+                    // GNOME Remote Login checks the redirected X.224 request for
+                    // RDSTLS support before deciding whether to show its insecure
+                    // handoff prompt. Keep advertising CredSSP as well so servers
+                    // can select the existing IronRDP authentication path.
+                    security_protocol.insert(nego::SecurityProtocol::RDSTLS);
+                }
+
                 if security_protocol.is_standard_rdp_security() {
                     return Err(reason_err!("Initiation", "standard RDP security is not supported",));
                 }
@@ -644,9 +652,10 @@ fn create_gcc_blocks<'a>(
     static_channels: impl Iterator<Item = &'a StaticVirtualChannel>,
 ) -> ConnectorResult<gcc::ClientGccBlocks> {
     use ironrdp_pdu::gcc::{
-        ClientCoreData, ClientCoreOptionalData, ClientEarlyCapabilityFlags, ClientGccBlocks, ClientNetworkData,
-        ClientSecurityData, ColorDepth, ConnectionType, EncryptionMethod, HighColorDepth, MonitorOrientation,
-        RdpVersion, SecureAccessSequence, SupportedColorDepths,
+        ClientClusterData, ClientCoreData, ClientCoreOptionalData, ClientEarlyCapabilityFlags, ClientGccBlocks,
+        ClientNetworkData, ClientSecurityData, ColorDepth, ConnectionType, EncryptionMethod, HighColorDepth,
+        MonitorOrientation, RdpVersion, RedirectionFlags, RedirectionVersion, SecureAccessSequence,
+        SupportedColorDepths,
     };
 
     let max_color_depth = config.bitmap.as_ref().map(|bitmap| bitmap.color_depth).unwrap_or(32);
@@ -745,8 +754,11 @@ fn create_gcc_blocks<'a>(
         } else {
             Some(ClientNetworkData { channels })
         },
-        // TODO(#139): support for Some(ClientClusterData { flags: RedirectionFlags::REDIRECTION_SUPPORTED, redirection_version: RedirectionVersion::V4, redirected_session_id: 0, }),
-        cluster: None,
+        cluster: Some(ClientClusterData {
+            flags: RedirectionFlags::REDIRECTION_SUPPORTED,
+            redirection_version: RedirectionVersion::V4,
+            redirected_session_id: 0,
+        }),
         monitor: None,
         // TODO(#140): support for Client Message Channel Data (https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/f50e791c-de03-4b25-b17e-e914c9020bc3)
         message_channel: None,

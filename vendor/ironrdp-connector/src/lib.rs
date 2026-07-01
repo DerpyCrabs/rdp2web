@@ -190,6 +190,12 @@ pub struct Config {
     /// computers.
     #[doc(alias("enable_nla", "nla"))]
     pub enable_credssp: bool,
+    /// RDS TLS security protocol.
+    ///
+    /// The PROTOCOL_RDSTLS flag will be set. When selected by the server,
+    /// callers must complete the RDSTLS authentication exchange after TLS
+    /// upgrade and before continuing with the basic settings exchange.
+    pub enable_rdstls: bool,
     pub credentials: Credentials,
     pub domain: Option<String>,
     /// The build number of the client.

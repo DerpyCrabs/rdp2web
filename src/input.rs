@@ -15,7 +15,7 @@ pub fn input_event_from_client(event: &ClientEvent) -> Vec<FastPathInputEvent> {
             delta_y,
         } => pointer_event(action, *x, *y, *button, *delta_y),
         ClientEvent::Key { down, code, key } => key_event(*down, code, key.as_deref()),
-        ClientEvent::Resize { .. } => Vec::new(),
+        ClientEvent::Resize { .. } | ClientEvent::Refresh { .. } => Vec::new(),
     }
 }
 

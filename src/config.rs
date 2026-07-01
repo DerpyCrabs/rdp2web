@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 const FALLBACK_DESKTOP_SIZE: (u16, u16) = (1280, 720);
 const DEFAULT_TLS_CERT_PATH: &str = "certs/rdp2web.crt";
 const DEFAULT_TLS_KEY_PATH: &str = "certs/rdp2web.key";
+const DEFAULT_DOTENV_FILE: &str = ".env";
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -28,14 +29,36 @@ pub struct RdpConfig {
     pub username: String,
     pub password: String,
     pub domain: Option<String>,
+    pub mode: RdpMode,
+    pub routing_token: Option<String>,
+    pub redirection_auth: Option<RdpRedirectionAuth>,
     pub width: u16,
     pub height: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct RdpRedirectionAuth {
+    pub flags: u32,
+    pub username: Option<String>,
+    pub domain: Option<String>,
+    pub password: Option<Vec<u8>>,
+    pub redirection_guid: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RdpMode {
+    Shared,
+    Session,
 }
 
 #[derive(Debug, Serialize)]
 pub struct PublicConfig {
     pub default_width: u16,
     pub default_height: u16,
+}
+
+pub fn load_dotenv() {
+    let _ = dotenvy::from_filename(dotenv_path());
 }
 
 impl AppConfig {
@@ -53,6 +76,9 @@ impl AppConfig {
             domain: env::var("RDP_DOMAIN")
                 .ok()
                 .filter(|value| !value.is_empty()),
+            mode: rdp_mode_from_env()?,
+            routing_token: None,
+            redirection_auth: None,
             width,
             height,
         };
@@ -79,6 +105,41 @@ impl AppConfig {
         PublicConfig {
             default_width: self.rdp.width,
             default_height: self.rdp.height,
+        }
+    }
+}
+
+fn dotenv_path() -> PathBuf {
+    env::var("RDP_ENV_FILE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DOTENV_FILE))
+}
+
+fn rdp_mode_from_env() -> anyhow::Result<RdpMode> {
+    match env::var("RDP_MODE") {
+        Ok(value) => rdp_mode_from_value(Some(&value)),
+        Err(env::VarError::NotPresent) => Ok(RdpMode::Shared),
+        Err(err) => Err(err).context("read RDP_MODE"),
+    }
+}
+
+fn rdp_mode_from_value(value: Option<&str>) -> anyhow::Result<RdpMode> {
+    match value {
+        Some(value) if value.trim().is_empty() => Ok(RdpMode::Shared),
+        Some(value) => RdpMode::parse(value),
+        None => Ok(RdpMode::Shared),
+    }
+}
+
+impl RdpMode {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "shared" | "share" | "screen-share" | "screen-sharing" | "remote-assistance"
+            | "assistance" => Ok(Self::Shared),
+            "session" | "login" | "remote-login" | "headless" => Ok(Self::Session),
+            other => bail!("RDP_MODE must be shared or session; got {other:?}"),
         }
     }
 }
@@ -153,6 +214,9 @@ mod tests {
                 username: "user".to_owned(),
                 password: "secret".to_owned(),
                 domain: None,
+                mode: RdpMode::Shared,
+                routing_token: None,
+                redirection_auth: None,
                 width: 1280,
                 height: 720,
             },
@@ -162,5 +226,20 @@ mod tests {
         assert!(!json.contains("127.0.0.1"));
         assert!(!json.contains("user"));
         assert!(!json.contains("secret"));
+    }
+
+    #[test]
+    fn missing_mode_defaults_to_shared_mode() {
+        assert_eq!(rdp_mode_from_value(None).unwrap(), RdpMode::Shared);
+    }
+
+    #[test]
+    fn empty_mode_defaults_to_shared_mode() {
+        assert_eq!(rdp_mode_from_value(Some("")).unwrap(), RdpMode::Shared);
+    }
+
+    #[test]
+    fn parses_remote_login_mode_alias() {
+        assert_eq!(RdpMode::parse("remote-login").unwrap(), RdpMode::Session);
     }
 }

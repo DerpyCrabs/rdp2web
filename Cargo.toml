@@ -11,6 +11,7 @@ futures-util = "0.3"
 ironrdp = { version = "0.16", features = ["connector", "graphics", "session"] }
 ironrdp-blocking = "0.9"
 ironrdp-core = "0.2"
+ironrdp-displaycontrol = "0.7.0"
 ironrdp-dvc = "0.7.0"
 ironrdp-egfx = "0.2.0"
 ironrdp-graphics = "0.8"

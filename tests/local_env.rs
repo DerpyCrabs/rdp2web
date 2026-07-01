@@ -4,11 +4,11 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 fn load_env() {
-    let _ = dotenvy::from_filename(".env.local");
+    rdp2web::config::load_dotenv();
 }
 
 #[test]
-fn env_local_contains_required_rdp_settings() {
+fn selected_env_contains_required_rdp_settings() {
     load_env();
 
     for key in [
