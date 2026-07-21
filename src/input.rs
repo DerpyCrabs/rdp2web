@@ -101,6 +101,13 @@ fn button_flag(button: Option<u8>) -> PointerFlags {
 }
 
 fn key_event(down: bool, code: &str, key: Option<&str>) -> Vec<FastPathInputEvent> {
+    // Never forward the Windows/Super key. It is easy for the browser or host
+    // desktop to leave it logically pressed, which makes the remote session
+    // interpret subsequent keystrokes as Windows-key shortcuts.
+    if matches!(code, "MetaLeft" | "MetaRight") {
+        return Vec::new();
+    }
+
     if let Some(scancode) = scancode_for_code(code) {
         let mut flags = KeyboardFlags::empty();
         if !down {
@@ -258,14 +265,6 @@ fn scancode_for_code(code: &str) -> Option<ScanCode> {
                     code: 0x51,
                     extended: true,
                 }),
-                "MetaLeft" => Some(ScanCode {
-                    code: 0x5b,
-                    extended: true,
-                }),
-                "MetaRight" => Some(ScanCode {
-                    code: 0x5c,
-                    extended: true,
-                }),
                 _ => None,
             };
         }
@@ -371,6 +370,22 @@ mod keyboard_tests {
                 assert_eq!(event.key_code, 0x4b);
             }
             other => panic!("expected slow-path scancode input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windows_keys_are_not_forwarded() {
+        for code in ["MetaLeft", "MetaRight"] {
+            for down in [true, false] {
+                let event = ClientEvent::Key {
+                    down,
+                    code: code.to_owned(),
+                    key: Some("Meta".to_owned()),
+                };
+
+                assert!(input_event_from_client(&event).is_empty());
+                assert!(slow_input_events_from_client(&event).is_empty());
+            }
         }
     }
 }
